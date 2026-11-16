@@ -491,10 +491,19 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
   }
   if (const char* e = std::getenv("FLINT_SPARSE_ATTN");
       e != nullptr && e[0] != '0') {
-    sparse_nblk = capacity / 64 + 2;
+    // The kernel keeps one score per block in LDS: 4096 blocks at most, which
+    // is exactly 262144 keys. The two spare blocks only fit below that.
+    const std::uint32_t exact_blocks =
+        static_cast<std::uint32_t>((capacity + 63) / 64);
+    sparse_nblk = std::min<std::uint32_t>(exact_blocks + 2, 4096);
     if (const char* t = std::getenv("FLINT_SPARSE_TOPK"))
       sparse_top = static_cast<std::uint32_t>(std::atoi(t));
-    sparse = sparse_nblk <= 4096 && sparse_top >= 1 && sparse_top <= 400;
+    sparse = exact_blocks <= 4096 && sparse_top >= 1 && sparse_top <= 400;
+    if (!sparse)
+      std::fprintf(stderr,
+                   "[flint] block-sparse attention disabled (capacity %zu, "
+                   "top %u)\n",
+                   static_cast<std::size_t>(capacity), sparse_top);
     if (sparse) {
       kmm.resize(c.num_layers);
       for (std::uint32_t il = 0; il < c.num_layers; ++il) {
