@@ -128,13 +128,14 @@ enum Stage : int {
   kStageCombine,
   kStageHead,
   kStageSwiglu,
+  kStageAttentionSwa,
   kStageCount,
 };
 
 constexpr const char* kStageNames[kStageCount] = {
     "embed",    "norm",        "qkv",     "rope+kv",     "attention",
     "out_proj", "dense_ffn",   "router",  "exp_gate_up", "exp_down",
-    "shared",   "moe_combine", "lm_head", "swiglu"};
+    "shared",   "moe_combine", "lm_head", "swiglu",      "attn_swa"};
 
 /// Attributes the time between consecutive marks to a stage. Off unless
 /// FLINT_PROFILE is set; syncs once per forward pass.
@@ -179,6 +180,12 @@ public:
     ++passes_;
     used_ = 0;
     stages_.clear();
+    // Cumulative report every 32k prefill tokens (the destructor alone is lost
+    // with the pod).
+    if (tokens > 1 && prefill_tokens_ >= next_report_) {
+      next_report_ = prefill_tokens_ + 32768;
+      Report();
+    }
   }
 
 private:
@@ -209,6 +216,7 @@ private:
   std::vector<int> stages_;
   std::size_t used_{0};
   std::uint32_t passes_{0};
+  std::uint64_t next_report_{32768};
   std::uint64_t prefill_tokens_{0};
   std::uint64_t decode_tokens_{0};
   double prefill_[kStageCount]{};
@@ -1172,7 +1180,7 @@ bool Session::Impl::AttnCore(std::uint32_t il, std::uint32_t n, bool prune,
       return Fail(error_msg, "Flint: unsupported attention geometry");
     }
   }
-  timer.Mark(kStageAttention, stream);
+  timer.Mark(window > 0 ? kStageAttentionSwa : kStageAttention, stream);
   this->ln = ln;
   this->lq8 = lq8;
   return true;
