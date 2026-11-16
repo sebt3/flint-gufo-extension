@@ -1298,6 +1298,9 @@ constexpr int kSliceWaves = 4;
 constexpr int kSliceThreads = kSliceWaves * 32;
 constexpr int kSliceRows = 2 * kSliceWaves;
 
+// kVariant bit 0: skip the compute of a wave that owns no row; bit 1: skip the
+// rescale of the accumulators when no lane of the wave moved its maximum.
+template <int kVariant>
 __global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
     const float* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, float* __restrict__ partial,
@@ -1397,7 +1400,7 @@ __global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
       }
     }
     __syncthreads();
-    if (t0 + 2 * wave >= rows_total)
+    if ((kVariant & 1) && t0 + 2 * wave >= rows_total)
       continue;  // this wave has no rows; it only staged
 
     v8f s_acc[kNb];
@@ -1453,7 +1456,7 @@ __global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
     }
     run_sum = run_sum * alpha + psum;
     run_max = m_new;
-    if (__builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0) {
+    if (!(kVariant & 2) || __builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0) {
 #pragma unroll
       for (int t = 0; t < 8; ++t)
         o_acc[t] *= alpha;
@@ -1868,14 +1871,32 @@ void AttentionSplit(const float* q, const __half* k_cache,
                     std::uint32_t window, std::uint32_t splits,
                     hipStream_t stream, std::uint32_t ring) {
   const std::uint32_t group = heads / kv_heads;
-  if (g_attention_mode == 0 && window == 0 && head_dim == 128 && group == 8 &&
+  if (g_attention_mode != 1 && window == 0 && head_dim == 128 && group == 8 &&
       n_tokens >= 1 && n_tokens <= 8) {
-    AttentionSliceWmmaKernel<<<dim3(kv_heads, splits,
-                                    (n_tokens + kSliceRows - 1) / kSliceRows),
-                               kSliceThreads, 0, stream>>>(
-        q, k_cache, v_cache, partial,
-                                            start_pos, heads, kv_heads, splits,
-                                            n_tokens, ring);
+    const dim3 grid(kv_heads, splits, (n_tokens + kSliceRows - 1) / kSliceRows);
+    // Modes 0 and 2..5 are variants of the same kernel (see its template).
+    switch (g_attention_mode) {
+      case 2:
+        AttentionSliceWmmaKernel<0><<<grid, kSliceThreads, 0, stream>>>(
+            q, k_cache, v_cache, partial, start_pos, heads, kv_heads, splits,
+            n_tokens, ring);
+        break;
+      case 3:
+        AttentionSliceWmmaKernel<1><<<grid, kSliceThreads, 0, stream>>>(
+            q, k_cache, v_cache, partial, start_pos, heads, kv_heads, splits,
+            n_tokens, ring);
+        break;
+      case 4:
+        AttentionSliceWmmaKernel<2><<<grid, kSliceThreads, 0, stream>>>(
+            q, k_cache, v_cache, partial, start_pos, heads, kv_heads, splits,
+            n_tokens, ring);
+        break;
+      default:
+        AttentionSliceWmmaKernel<3><<<grid, kSliceThreads, 0, stream>>>(
+            q, k_cache, v_cache, partial, start_pos, heads, kv_heads, splits,
+            n_tokens, ring);
+        break;
+    }
   } else if (window == 0 && n_tokens > 1 && head_dim == 128) {
     // Two rows per block: the K/V tile is shared by both, while the block's
     // shared memory stays small enough for two blocks per CU, which the

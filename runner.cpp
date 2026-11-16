@@ -502,7 +502,7 @@ public:
       }
       // Row invariance: each row of an 8-row pass against the same row alone
       // (same position, same query), bit for bit.
-      for (const int mode : {1, 0}) {
+      for (const int mode : {1, 0, 2, 3, 4}) {
         const std::uint32_t start8 = depth - 8;
         hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
         rk::SetAttentionMode(mode);
@@ -539,7 +539,7 @@ public:
           }
         }
         Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
-            " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") +
+            " row_invariance mode=" + std::string(mode == 1 ? "scalar" : "wmma-v" + std::to_string(mode)) +
             " bad_rows=[" + bad + "] worst_abs_diff=" + std::to_string(worst));
       }
       rk::SetAttentionMode(0);
