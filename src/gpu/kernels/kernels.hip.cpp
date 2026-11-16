@@ -1281,18 +1281,24 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernel(
 }
 
 // Decode / verify attention of a global layer over one key slice, on the matrix
-// cores. One wave per block, one block per (kv head, key slice, pair of rows):
-// the wave owns 16 queries = 2 rows x the 8 query heads of the group, computes
-// S^T = K Q^T in registers (so the softmax needs no cross-lane traffic beyond
-// one max), and accumulates O^T = V^T P^T. Output is the same partial the scalar
-// slice kernels write (numerator, natural-log maximum, denominator), merged by
-// AttentionMergeKernel, which also applies the sink.
+// cores. One block per (kv head, key slice, group of 8 rows); each of the four
+// waves owns 16 queries = 2 rows x the 8 query heads of the group, and the four
+// waves share every K/V tile, which the block stages in LDS once: a width-8
+// verify pass reads the global KV once, not once per row pair.
+// A wave computes S^T = K Q^T in registers (the softmax needs no cross-lane
+// traffic beyond one max) and accumulates O^T = V^T P^T. Output is the same
+// partial the scalar slice kernels write (numerator, natural-log maximum,
+// denominator), merged by AttentionMergeKernel, which also applies the sink.
 //
 // The partition is by block index (block b belongs to slice b % splits), never
 // by position, and each query masks the keys past its own position and carries
 // its own running maximum: a row accumulates exactly the same sequence whether
 // it travels alone or in a verify batch, so the rows stay bit-identical.
-__global__ __launch_bounds__(32) void AttentionSliceWmmaKernel(
+constexpr int kSliceWaves = 4;
+constexpr int kSliceThreads = kSliceWaves * 32;
+constexpr int kSliceRows = 2 * kSliceWaves;
+
+__global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
     const float* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, float* __restrict__ partial,
     const std::uint32_t* __restrict__ start_pos, std::uint32_t heads,
@@ -1303,19 +1309,21 @@ __global__ __launch_bounds__(32) void AttentionSliceWmmaKernel(
   __shared__ __align__(16) char smem[kKBytes + kVBytes];
   auto* k_s = reinterpret_cast<__half*>(smem);
   auto* v_t = reinterpret_cast<__half*>(smem + kKBytes);
-  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t wave = tid >> 5U;
   const std::uint32_t sub = lane & 15U;
   const std::uint32_t half_id = lane >> 4U;
   const std::uint32_t kv_head = blockIdx.x;
   const std::uint32_t split = blockIdx.y;
-  const std::uint32_t t0 = blockIdx.z * 2;
+  const std::uint32_t t0 = blockIdx.z * kSliceRows;
   const std::uint32_t start = *start_pos;
   const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * kWmmaHeadDim;
   constexpr float kLog2e = 1.4426950408889634F;
   constexpr float kLn2 = 0.6931471805599453F;
   const float scale = 0.08838834764831845F * kLog2e;  // log2(e) / sqrt(128)
 
-  const std::uint32_t token = t0 + sub / kWmmaGroup;
+  const std::uint32_t token = t0 + 2 * wave + sub / kWmmaGroup;
   const std::uint32_t head = kv_head * kWmmaGroup + sub % kWmmaGroup;
   const bool live = token < rows_total;
   const std::uint32_t qpos = start + token;
@@ -1351,16 +1359,20 @@ __global__ __launch_bounds__(32) void AttentionSliceWmmaKernel(
   for (int t = 0; t < 8; ++t)
     o_acc[t] = v8f{};
 
-  const std::uint32_t pos_max = start + min(t0 + 1, rows_total - 1);
+  const std::uint32_t last_row = min(t0 + kSliceRows, rows_total) - 1;
+  const std::uint32_t pos_max = start + last_row;
   const std::uint32_t nblocks = (pos_max + kWmmaKeys) / kWmmaKeys;
   const bool odd = (lane & 1U) != 0;
+  constexpr int kLoads = kWmmaKeys * 16 / kSliceThreads;  // uint4 per thread
   for (std::uint32_t b = split; b < nblocks; b += splits) {
     const std::uint32_t kt = b * kWmmaKeys;
     __syncthreads();
-    // Lane = key: this lane stages its K row and its slice of V^T.
+    // Lanes run along keys: lane = key, and the waves take interleaved 16-byte
+    // chunks of the row (chunk c = wave + 4u).
     const std::uint32_t key_pos = kt + lane;
 #pragma unroll
-    for (int c = 0; c < 16; ++c) {
+    for (int u = 0; u < kLoads; ++u) {
+      const std::uint32_t c = wave + kSliceWaves * u;
       uint4 kv = make_uint4(0, 0, 0, 0);
       uint4 vv = kv;
       if (key_pos <= pos_max) {
@@ -1385,6 +1397,8 @@ __global__ __launch_bounds__(32) void AttentionSliceWmmaKernel(
       }
     }
     __syncthreads();
+    if (t0 + 2 * wave >= rows_total)
+      continue;  // this wave has no rows; it only staged
 
     v8f s_acc[kNb];
 #pragma unroll
@@ -1856,8 +1870,10 @@ void AttentionSplit(const float* q, const __half* k_cache,
   const std::uint32_t group = heads / kv_heads;
   if (g_attention_mode == 0 && window == 0 && head_dim == 128 && group == 8 &&
       n_tokens >= 1 && n_tokens <= 8) {
-    AttentionSliceWmmaKernel<<<dim3(kv_heads, splits, (n_tokens + 1) / 2), 32,
-                               0, stream>>>(q, k_cache, v_cache, partial,
+    AttentionSliceWmmaKernel<<<dim3(kv_heads, splits,
+                                    (n_tokens + kSliceRows - 1) / kSliceRows),
+                               kSliceThreads, 0, stream>>>(
+        q, k_cache, v_cache, partial,
                                             start_pos, heads, kv_heads, splits,
                                             n_tokens, ring);
   } else if (window == 0 && n_tokens > 1 && head_dim == 128) {

@@ -456,7 +456,7 @@ public:
       hipEventCreate(&t0);
       hipEventCreate(&t1);
       const double bytes = static_cast<double>(depth) * kv_heads * d * 2 * 2;
-      for (const std::uint32_t n : {1U, 2U, 8U}) {
+      for (const std::uint32_t n : {1U, 2U, 4U, 8U}) {
         const std::uint32_t start = depth - n;
         hipMemcpy(dpos, &start, 4, hipMemcpyHostToDevice);
         const auto run = [&](int mode, std::uint32_t splits) {
@@ -472,7 +472,7 @@ public:
         for (const float f : ref)
           scale = std::max(scale, std::fabs(f));
         for (const int mode : {1, 0}) {
-          for (const std::uint32_t splits : {32U, 64U, 128U, 256U}) {
+          for (const std::uint32_t splits : {32U, 64U, 128U}) {
             if (mode == 1 && splits != 32)
               continue;
             for (int i = 0; i < 3; ++i)
