@@ -535,6 +535,48 @@ public:
             " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") + " " +
             report);
       }
+      // Where does a masked key leak into a row? Perturb the key just past row
+      // 0 (it is masked for row 0 and live for row 1) and see what moves.
+      {
+        const std::uint32_t start8 = depth - 8;
+        rk::SetAttentionMode(0);
+        hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
+        const auto pair_run = [&](std::vector<float>* out) {
+          rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, 2, dpos,
+                             heads, kv_heads, d, 0, 64, nullptr, 0);
+          hipDeviceSynchronize();
+          out->resize(std::size_t{2} * heads * d);
+          hipMemcpy(out->data(), dout, out->size() * 4, hipMemcpyDeviceToHost);
+        };
+        std::vector<float> base, moved;
+        pair_run(&base);
+        const std::size_t off = std::size_t{start8 + 1} * kv_heads * d;
+        const std::size_t bytes = std::size_t{kv_heads} * d * 2;
+        std::vector<__half> keep_k(bytes / 2), keep_v(bytes / 2),
+            zero(bytes / 2, __float2half(0.0F));
+        hipMemcpy(keep_k.data(), dk + off, bytes, hipMemcpyDeviceToHost);
+        hipMemcpy(keep_v.data(), dv + off, bytes, hipMemcpyDeviceToHost);
+        const std::size_t half_row = std::size_t{heads} * d * 4;
+        std::string out_line;
+        hipMemcpy(dv + off, zero.data(), bytes, hipMemcpyHostToDevice);
+        pair_run(&moved);
+        out_line += std::memcmp(base.data(), moved.data(), half_row) == 0
+                        ? "V0 row0 same; "
+                        : "V0 row0 MOVES; ";
+        out_line += std::memcmp(base.data() + heads * d, moved.data() + heads * d,
+                                half_row) == 0
+                        ? "row1 same; "
+                        : "row1 moves; ";
+        hipMemcpy(dv + off, keep_v.data(), bytes, hipMemcpyHostToDevice);
+        hipMemcpy(dk + off, zero.data(), bytes, hipMemcpyHostToDevice);
+        pair_run(&moved);
+        out_line += std::memcmp(base.data(), moved.data(), half_row) == 0
+                        ? "K0 row0 same; "
+                        : "K0 row0 MOVES; ";
+        hipMemcpy(dk + off, keep_k.data(), bytes, hipMemcpyHostToDevice);
+        Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
+            " leak_probe " + out_line);
+      }
       rk::SetAttentionMode(0);
       hipEventDestroy(t0);
       hipEventDestroy(t1);
