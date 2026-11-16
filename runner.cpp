@@ -501,41 +501,46 @@ public:
         }
       }
       // Row invariance: each row of an 8-row pass against the same row alone
-      // (same position, same query), bit for bit, on the matrix-core kernel.
-      {
+      // (same position, same query), bit for bit.
+      for (const int mode : {1, 0}) {
         const std::uint32_t start8 = depth - 8;
         hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
-        rk::SetAttentionMode(0);
+        rk::SetAttentionMode(mode);
+        const std::uint32_t splits = mode == 1 ? 32 : 64;
         rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, 8, dpos,
-                           heads, kv_heads, d, 0, 64, nullptr, 0);
+                           heads, kv_heads, d, 0, splits, nullptr, 0);
         hipDeviceSynchronize();
         std::vector<float> batch(std::size_t{8} * heads * d),
             single(std::size_t{heads} * d);
         hipMemcpy(batch.data(), dout, batch.size() * 4, hipMemcpyDeviceToHost);
-        std::uint32_t bad_rows = 0;
+        std::string bad;
         float worst = 0.0F;
         for (std::uint32_t row = 0; row < 8; ++row) {
           const std::uint32_t start1 = start8 + row;
           hipMemcpy(dpos, &start1, 4, hipMemcpyHostToDevice);
           rk::AttentionSplit(dq + std::size_t{row} * heads * d, dk, dv, dsink,
                              dout, nullptr, dpart, 1, dpos, heads, kv_heads, d,
-                             0, 64, nullptr, 0);
+                             0, splits, nullptr, 0);
           hipDeviceSynchronize();
           hipMemcpy(single.data(), dout, single.size() * 4,
                     hipMemcpyDeviceToHost);
           const float* in_batch = batch.data() + std::size_t{row} * heads * d;
           if (std::memcmp(in_batch, single.data(), single.size() * 4) != 0) {
-            ++bad_rows;
+            bad += std::to_string(row) + " ";
+            // Which heads differ, to tell a column effect from a position one.
+            std::uint32_t heads_bad = 0;
+            for (std::uint32_t h = 0; h < heads; ++h)
+              if (std::memcmp(in_batch + h * d, single.data() + h * d, d * 4) !=
+                  0)
+                ++heads_bad;
+            bad += "(" + std::to_string(heads_bad) + "h) ";
             for (std::size_t i = 0; i < single.size(); ++i)
               worst = std::max(worst, std::fabs(in_batch[i] - single[i]));
           }
         }
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "event=attn_bench depth=%u row_invariance bad_rows=%u/8 "
-                      "worst_abs_diff=%.3e",
-                      depth, bad_rows, worst);
-        Log(line);
+        Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
+            " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") +
+            " bad_rows=[" + bad + "] worst_abs_diff=" + std::to_string(worst));
       }
       rk::SetAttentionMode(0);
       hipEventDestroy(t0);
