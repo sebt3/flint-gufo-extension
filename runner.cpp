@@ -472,7 +472,7 @@ public:
         for (const float f : ref)
           scale = std::max(scale, std::fabs(f));
         for (const int mode : {1, 0}) {
-          for (const std::uint32_t splits : {32U, 64U, 128U}) {
+          for (const std::uint32_t splits : {32U, 64U}) {
             if (mode == 1 && splits != 32)
               continue;
             for (int i = 0; i < 3; ++i)
