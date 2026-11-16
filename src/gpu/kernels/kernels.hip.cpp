@@ -1365,6 +1365,11 @@ __global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
   const std::uint32_t last_row = min(t0 + kSliceRows, rows_total) - 1;
   const std::uint32_t pos_max = start + last_row;
   const std::uint32_t nblocks = (pos_max + kWmmaKeys) / kWmmaKeys;
+  // Keys are staged up to the end of their even/odd pair. V of a key a query
+  // masks still moves that query's output by a few ulps of the accumulator, so a
+  // row must see the same staged data whether it travels alone or in a block;
+  // the pair is the unit the V^T staging packs.
+  const std::uint32_t pos_load = pos_max | 1U;
   const bool odd = (lane & 1U) != 0;
   constexpr int kLoads = kWmmaKeys * 16 / kSliceThreads;  // uint4 per thread
   for (std::uint32_t b = split; b < nblocks; b += splits) {
@@ -1378,7 +1383,7 @@ __global__ __launch_bounds__(kSliceThreads) void AttentionSliceWmmaKernel(
       const std::uint32_t c = wave + kSliceWaves * u;
       uint4 kv = make_uint4(0, 0, 0, 0);
       uint4 vv = kv;
-      if (key_pos <= pos_max) {
+      if (key_pos <= pos_load) {
         const std::size_t src =
             KvRow(key_pos, ring) * kv_row + kv_head * kWmmaHeadDim + c * 8;
         kv = *reinterpret_cast<const uint4*>(k_cache + src);

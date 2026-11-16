@@ -500,40 +500,46 @@ public:
           }
         }
       }
-      // Row invariance: the same row computed alone (n=1), in a pair (n=2) and
-      // in a block of eight, bit for bit. "E" marks equality of the pair of runs.
+      // Row invariance over 8 start offsets: every row of an 8-row block, of a
+      // pair and alone, bit for bit (64 rows per depth, and per pair size).
       for (const int mode : {1, 0}) {
-        const std::uint32_t start8 = depth - 8;
         const std::uint32_t splits = mode == 1 ? 32 : 64;
         rk::SetAttentionMode(mode);
-        const auto call = [&](std::uint32_t first_row, std::uint32_t count,
-                              std::vector<float>* out) {
-          const std::uint32_t start = start8 + first_row;
-          hipMemcpy(dpos, &start, 4, hipMemcpyHostToDevice);
-          rk::AttentionSplit(dq + std::size_t{first_row} * heads * d, dk, dv,
-                             dsink, dout, nullptr, dpart, count, dpos, heads,
-                             kv_heads, d, 0, splits, nullptr, 0);
-          hipDeviceSynchronize();
-          out->resize(std::size_t{count} * heads * d);
-          hipMemcpy(out->data(), dout, out->size() * 4, hipMemcpyDeviceToHost);
-        };
-        std::vector<float> b8, p2, s1;
-        call(0, 8, &b8);
-        std::string report;
-        for (std::uint32_t row = 0; row < 8; ++row) {
-          call(row & ~1U, 2, &p2);
-          call(row, 1, &s1);
+        std::uint32_t bad_pair = 0, bad_single = 0, total = 0;
+        for (std::uint32_t offs = 0; offs < 8; ++offs) {
+          const std::uint32_t start8 = depth - 8 + offs;
+          const auto call = [&](std::uint32_t first_row, std::uint32_t count,
+                                std::vector<float>* out) {
+            const std::uint32_t start = start8 + first_row;
+            hipMemcpy(dpos, &start, 4, hipMemcpyHostToDevice);
+            rk::AttentionSplit(dq + std::size_t{first_row} * heads * d, dk, dv,
+                               dsink, dout, nullptr, dpart, count, dpos, heads,
+                               kv_heads, d, 0, splits, nullptr, 0);
+            hipDeviceSynchronize();
+            out->resize(std::size_t{count} * heads * d);
+            hipMemcpy(out->data(), dout, out->size() * 4,
+                      hipMemcpyDeviceToHost);
+          };
+          std::vector<float> b8, p2, s1;
+          call(0, 8, &b8);
           const std::size_t n = std::size_t{heads} * d * 4;
-          const float* in8 = b8.data() + std::size_t{row} * heads * d;
-          const float* in2 = p2.data() + std::size_t{row & 1U} * heads * d;
-          report += "r" + std::to_string(row) + ":";
-          report += std::memcmp(in8, in2, n) == 0 ? "8=2 " : "8!2 ";
-          report += std::memcmp(in2, s1.data(), n) == 0 ? "2=1 " : "2!1 ";
-          report += std::memcmp(in8, s1.data(), n) == 0 ? "8=1 | " : "8!1 | ";
+          for (std::uint32_t row = 0; row < 8; ++row) {
+            call(row & ~1U, 2, &p2);
+            call(row, 1, &s1);
+            const float* in8 = b8.data() + std::size_t{row} * heads * d;
+            ++total;
+            if (std::memcmp(in8, p2.data() + std::size_t{row & 1U} * heads * d,
+                            n) != 0)
+              ++bad_pair;
+            if (std::memcmp(in8, s1.data(), n) != 0)
+              ++bad_single;
+          }
         }
         Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
-            " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") + " " +
-            report);
+            " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") +
+            " rows=" + std::to_string(total) + " block_vs_pair_bad=" +
+            std::to_string(bad_pair) + " block_vs_single_bad=" +
+            std::to_string(bad_single));
       }
       // Where does a masked key leak into a row? Perturb the key just past row
       // 0 (it is masked for row 0 and live for row 1) and see what moves.
