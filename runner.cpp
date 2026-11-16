@@ -500,47 +500,40 @@ public:
           }
         }
       }
-      // Row invariance: each row of an 8-row pass against the same row alone
-      // (same position, same query), bit for bit.
-      for (const int mode : {1, 0, 2, 3, 4}) {
+      // Row invariance: the same row computed alone (n=1), in a pair (n=2) and
+      // in a block of eight, bit for bit. "E" marks equality of the pair of runs.
+      for (const int mode : {1, 0}) {
         const std::uint32_t start8 = depth - 8;
-        hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
-        rk::SetAttentionMode(mode);
         const std::uint32_t splits = mode == 1 ? 32 : 64;
-        rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, 8, dpos,
-                           heads, kv_heads, d, 0, splits, nullptr, 0);
-        hipDeviceSynchronize();
-        std::vector<float> batch(std::size_t{8} * heads * d),
-            single(std::size_t{heads} * d);
-        hipMemcpy(batch.data(), dout, batch.size() * 4, hipMemcpyDeviceToHost);
-        std::string bad;
-        float worst = 0.0F;
-        for (std::uint32_t row = 0; row < 8; ++row) {
-          const std::uint32_t start1 = start8 + row;
-          hipMemcpy(dpos, &start1, 4, hipMemcpyHostToDevice);
-          rk::AttentionSplit(dq + std::size_t{row} * heads * d, dk, dv, dsink,
-                             dout, nullptr, dpart, 1, dpos, heads, kv_heads, d,
-                             0, splits, nullptr, 0);
+        rk::SetAttentionMode(mode);
+        const auto call = [&](std::uint32_t first_row, std::uint32_t count,
+                              std::vector<float>* out) {
+          const std::uint32_t start = start8 + first_row;
+          hipMemcpy(dpos, &start, 4, hipMemcpyHostToDevice);
+          rk::AttentionSplit(dq + std::size_t{first_row} * heads * d, dk, dv,
+                             dsink, dout, nullptr, dpart, count, dpos, heads,
+                             kv_heads, d, 0, splits, nullptr, 0);
           hipDeviceSynchronize();
-          hipMemcpy(single.data(), dout, single.size() * 4,
-                    hipMemcpyDeviceToHost);
-          const float* in_batch = batch.data() + std::size_t{row} * heads * d;
-          if (std::memcmp(in_batch, single.data(), single.size() * 4) != 0) {
-            bad += std::to_string(row) + " ";
-            // Which heads differ, to tell a column effect from a position one.
-            std::uint32_t heads_bad = 0;
-            for (std::uint32_t h = 0; h < heads; ++h)
-              if (std::memcmp(in_batch + h * d, single.data() + h * d, d * 4) !=
-                  0)
-                ++heads_bad;
-            bad += "(" + std::to_string(heads_bad) + "h) ";
-            for (std::size_t i = 0; i < single.size(); ++i)
-              worst = std::max(worst, std::fabs(in_batch[i] - single[i]));
-          }
+          out->resize(std::size_t{count} * heads * d);
+          hipMemcpy(out->data(), dout, out->size() * 4, hipMemcpyDeviceToHost);
+        };
+        std::vector<float> b8, p2, s1;
+        call(0, 8, &b8);
+        std::string report;
+        for (std::uint32_t row = 0; row < 8; ++row) {
+          call(row & ~1U, 2, &p2);
+          call(row, 1, &s1);
+          const std::size_t n = std::size_t{heads} * d * 4;
+          const float* in8 = b8.data() + std::size_t{row} * heads * d;
+          const float* in2 = p2.data() + std::size_t{row & 1U} * heads * d;
+          report += "r" + std::to_string(row) + ":";
+          report += std::memcmp(in8, in2, n) == 0 ? "8=2 " : "8!2 ";
+          report += std::memcmp(in2, s1.data(), n) == 0 ? "2=1 " : "2!1 ";
+          report += std::memcmp(in8, s1.data(), n) == 0 ? "8=1 | " : "8!1 | ";
         }
         Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
-            " row_invariance mode=" + std::string(mode == 1 ? "scalar" : "wmma-v" + std::to_string(mode)) +
-            " bad_rows=[" + bad + "] worst_abs_diff=" + std::to_string(worst));
+            " row_invariance mode=" + (mode == 1 ? "scalar" : "wmma") + " " +
+            report);
       }
       rk::SetAttentionMode(0);
       hipEventDestroy(t0);
