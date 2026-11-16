@@ -399,10 +399,12 @@ public:
     }
   }
 
-  // FLINT_ATTN_BENCH=1: times the decode attention of a global layer on
-  // synthetic KV at 8k / 32k / 131k, scalar kernels against the matrix-core
-  // slice kernel, for 1, 2 and 8 rows and several slice counts, and prints the
-  // largest difference to the scalar result.
+  // FLINT_ATTN_BENCH=1: the decode attention of a global layer on synthetic KV
+  // at 8k / 32k / 131k. Times the scalar kernels against the matrix-core slice
+  // kernel (1, 2, 4 and 8 rows, several slice counts) with the largest
+  // difference to the scalar result, then checks row invariance: 64 rows per
+  // depth, each computed in a block of eight, in a pair and alone, must be
+  // bit-identical (the scalar kernels are the reference).
   void AttentionBench() const {
     const char* enabled = std::getenv("FLINT_ATTN_BENCH");
     if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0')
@@ -540,48 +542,6 @@ public:
             " rows=" + std::to_string(total) + " block_vs_pair_bad=" +
             std::to_string(bad_pair) + " block_vs_single_bad=" +
             std::to_string(bad_single));
-      }
-      // Where does a masked key leak into a row? Perturb the key just past row
-      // 0 (it is masked for row 0 and live for row 1) and see what moves.
-      {
-        const std::uint32_t start8 = depth - 8;
-        rk::SetAttentionMode(0);
-        hipMemcpy(dpos, &start8, 4, hipMemcpyHostToDevice);
-        const auto pair_run = [&](std::vector<float>* out) {
-          rk::AttentionSplit(dq, dk, dv, dsink, dout, nullptr, dpart, 2, dpos,
-                             heads, kv_heads, d, 0, 64, nullptr, 0);
-          hipDeviceSynchronize();
-          out->resize(std::size_t{2} * heads * d);
-          hipMemcpy(out->data(), dout, out->size() * 4, hipMemcpyDeviceToHost);
-        };
-        std::vector<float> base, moved;
-        pair_run(&base);
-        const std::size_t off = std::size_t{start8 + 1} * kv_heads * d;
-        const std::size_t bytes = std::size_t{kv_heads} * d * 2;
-        std::vector<__half> keep_k(bytes / 2), keep_v(bytes / 2),
-            zero(bytes / 2, __float2half(0.0F));
-        hipMemcpy(keep_k.data(), dk + off, bytes, hipMemcpyDeviceToHost);
-        hipMemcpy(keep_v.data(), dv + off, bytes, hipMemcpyDeviceToHost);
-        const std::size_t half_row = std::size_t{heads} * d * 4;
-        std::string out_line;
-        hipMemcpy(dv + off, zero.data(), bytes, hipMemcpyHostToDevice);
-        pair_run(&moved);
-        out_line += std::memcmp(base.data(), moved.data(), half_row) == 0
-                        ? "V0 row0 same; "
-                        : "V0 row0 MOVES; ";
-        out_line += std::memcmp(base.data() + heads * d, moved.data() + heads * d,
-                                half_row) == 0
-                        ? "row1 same; "
-                        : "row1 moves; ";
-        hipMemcpy(dv + off, keep_v.data(), bytes, hipMemcpyHostToDevice);
-        hipMemcpy(dk + off, zero.data(), bytes, hipMemcpyHostToDevice);
-        pair_run(&moved);
-        out_line += std::memcmp(base.data(), moved.data(), half_row) == 0
-                        ? "K0 row0 same; "
-                        : "K0 row0 MOVES; ";
-        hipMemcpy(dk + off, keep_k.data(), bytes, hipMemcpyHostToDevice);
-        Log(std::string("event=attn_bench depth=") + std::to_string(depth) +
-            " leak_probe " + out_line);
       }
       rk::SetAttentionMode(0);
       hipEventDestroy(t0);
@@ -804,7 +764,8 @@ public:
       throw std::logic_error("Flint prefill has no remaining input");
     const std::size_t consumed = std::min<std::size_t>(
         {max_input_tokens, prompt.size() - offset, kPrefillChunk});
-    if (flint.draft() != nullptr && prompt.size() > draft_max_context_)
+    if (flint.draft() != nullptr && draft_max_context_ != 0 &&
+        prompt.size() > draft_max_context_)
       flint.stop_speculating();
     const auto chunk = FlintEngineTokens(prompt.subspan(offset, consumed));
     std::string error;
@@ -863,7 +824,7 @@ public:
       sampling::SamplerState& sampler) const override {
     auto& flint = RequireFlintState(state);
     if (flint.draft() != nullptr && flint.speculating() &&
-        flint.position() > draft_max_context_)
+        draft_max_context_ != 0 && flint.position() > draft_max_context_)
       flint.stop_speculating();
     if (flint.draft() == nullptr || !flint.speculating() || max_draft_ == 0) {
       FlushPending(flint);
@@ -1171,10 +1132,11 @@ private:
   std::uint32_t max_context_;
   std::uint32_t max_draft_{0};
   bool draft_fixed_{false};
-  // Speculation pays up to about this many tokens of context: beyond it the
-  // verification pass costs more in attention than the accepted tokens save
-  // (measured: parity at 9k, -10 % at 38k, -15 % at 125k).
-  std::uint32_t draft_max_context_{8192};
+  // No speculation for a request longer than this many tokens (0: no limit).
+  // With the scalar attention kernels it paid up to ~8k only (the verify pass
+  // re-read the KV once per row); the matrix-core kernel made it pay at every
+  // depth, so the default is no limit.
+  std::uint32_t draft_max_context_{0};
   cache::Identity component_identity_;
 };
 

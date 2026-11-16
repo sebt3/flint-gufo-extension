@@ -38,9 +38,10 @@ Enable with `--speculative dflash2 --dflash-model <Flint-DFlash2-*.gguf>`.
 * Block length: 3 proposals greedy, 2 when sampling (the cost of a verified row
   is ~2.5 ms against ~14 ms for a plain step, and each extra row is accepted less
   often). `FLINT_DRAFT_TOKENS` fixes it.
-* No speculation for a request whose prompt or position exceeds 8192 tokens
-  (`FLINT_DRAFT_MAX_CONTEXT`): the verification pass reads the KV once per row
-  and costs more than it saves at depth.
+* `FLINT_DRAFT_MAX_CONTEXT=<tokens>`: no speculation for a request longer than
+  that (default: no limit). With the scalar attention kernels the verification
+  pass re-read the KV once per row and speculation paid up to ~8k only; the
+  matrix-core kernel (`docs/ATTENTION-WMMA.md`) made it pay at every depth.
 * `FLINT_DRAFT_REJECTION=1`: rejection sampling against the drafter's own
   distribution; measured no better than the match rule, which is rejection
   sampling for a deterministic draft.
@@ -50,8 +51,11 @@ Enable with `--speculative dflash2 --dflash-model <Flint-DFlash2-*.gguf>`.
 
 | | no drafter | with drafter |
 |---|---|---|
-| T=0, mean of 4 prompts | 67 tok/s | 86 |
-| T=1, mean of 4 prompts | 69 | 79 |
+| T=0, mean of 4 prompts | 68 tok/s | 87 |
+| T=1, mean of 4 prompts | 67 | 76 |
+
+By depth (T=1, 150 tokens, cold prefill), no drafter -> drafter: 2k 67 -> 98, 9k
+62 -> 75, 36k 46 -> 69, 128k 25 -> 43.5 tok/s.
 
 A round costs ~4.4 ms of drafting and ~20 ms of verification for 3 rows;
 proposal acceptance is 40-65 %. Cache restore, cold prefill and four
