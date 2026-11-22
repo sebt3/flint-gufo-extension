@@ -1735,6 +1735,10 @@ void* Session::KvRows(std::uint32_t layer, bool value) noexcept {
   return (value ? impl_->v_cache : impl_->k_cache)[layer].get();
 }
 
+std::uint32_t Session::KvRingRows(std::uint32_t layer) const noexcept {
+  return layer < impl_->ring.size() ? impl_->ring[layer] : 0;
+}
+
 bool Session::RestoreRows(std::uint32_t position, std::string* error_msg) {
   const Config& c = impl_->model->config;
   if (position > impl_->capacity)

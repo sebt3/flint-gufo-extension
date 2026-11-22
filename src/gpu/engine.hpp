@@ -121,6 +121,10 @@ public:
   [[nodiscard]] const void* KvRows(std::uint32_t layer,
                                    bool value) const noexcept;
   [[nodiscard]] void* KvRows(std::uint32_t layer, bool value) noexcept;
+  /// Rows of the ring that holds `layer`'s K/V when it is a sliding-window layer
+  /// (position p lives at row p % ring), 0 when the layer holds every position
+  /// linearly (row p at p).
+  [[nodiscard]] std::uint32_t KvRingRows(std::uint32_t layer) const noexcept;
   /// Waits for all work this session has queued.
   [[nodiscard]] bool Synchronize(std::string* error_msg) const;
   /// Declares the first `position` rows of every layer to be in place (written

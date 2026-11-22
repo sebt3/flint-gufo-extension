@@ -21,6 +21,10 @@
 // | 3 + 2*l | K(l)      | kAppendRows   | num_kv*head_dim*2| 256            | 0            |
 // | 4 + 2*l | V(l)      | kAppendRows   | num_kv*head_dim*2| 256            | 0            |
 //
+// A sliding-window layer l (identity version 3) has kWindowRows components with
+// window_rows = sliding_window instead: the session keeps its keys in a ring
+// (position p at row p % ring), rows stay absolute in the cache.
+//
 // Rows are token-major, [position][num_kv * head_dim] of __half, exactly the
 // engine's per-layer K/V buffer layout. The component table is parallel to
 // descriptors_: index i holds id i + 1.
@@ -46,10 +50,10 @@ void SyncSession(const FlintSession& session) {
 }
 
 using Coverage = std::vector<std::pair<std::size_t, std::size_t>>;
-bool Covered(const Coverage& ranges, std::size_t end) {
+bool Covered(const Coverage& ranges, std::size_t begin, std::size_t end) {
   Coverage sorted = ranges;
   std::ranges::sort(sorted);
-  std::size_t frontier = 0;
+  std::size_t frontier = begin;
   for (const auto& [first, last] : sorted) {
     if (first > frontier)
       return false;
@@ -110,7 +114,7 @@ public:
     try {
       session->SetRowWriteHook({});
       for (const auto& component : adapter.components_)
-        if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+        if (cache::HasRows(component.descriptor.kind))
           guard.BeforeRelease(component.descriptor.id, 0, adapter.context_);
     } catch (...) {
     }
@@ -178,15 +182,20 @@ FlintContinuationAdapter::FlintContinuationAdapter(
   components_.push_back(logits);
 
   for (std::uint32_t layer = 0; layer < config.num_layers; ++layer) {
+    // A sliding-window layer reads only its last `sliding_window` rows, and the
+    // session keeps them in a ring: its components are window rows.
+    const bool window = config.IsSwa(layer) && config.sliding_window != 0;
     for (const bool is_value : {false, true}) {
       Component rows;
       rows.descriptor = {
           .id = {3 + 2 * layer + (is_value ? 1U : 0U)},
           .layout_version = 1,
-          .kind = cache::ComponentKind::kAppendRows,
+          .kind = window ? cache::ComponentKind::kWindowRows
+                         : cache::ComponentKind::kAppendRows,
           .row_bytes = row_bytes_,
           .rows_per_chunk = kRowsPerChunk,
-          .state_bytes = 0};
+          .state_bytes = 0,
+          .window_rows = window ? config.sliding_window : 0};
       rows.layer = layer;
       rows.is_value = is_value;
       components_.push_back(rows);
@@ -202,7 +211,7 @@ FlintContinuationAdapter::FlintContinuationAdapter(
   // Identity version 2 is the compatibility epoch for this layout. It is a
   // separate versioning from the descriptor layout_version = 1 (per-component
   // format), and bumps whenever the component table changes.
-  put(2);
+  put(3);
   put(context_);
 }
 
@@ -275,7 +284,7 @@ std::unique_ptr<cache::Slot> FlintContinuationAdapter::CreateSlot(
     throw std::runtime_error("Flint session row size differs from the layout");
   std::size_t layers = 0;
   for (const auto& component : components_)
-    if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+    if (cache::HasRows(component.descriptor.kind))
       ++layers;
   if (session->NumLayers() * std::size_t{2} != layers)
     throw std::runtime_error("Flint session layer count differs from the layout");
@@ -288,9 +297,20 @@ std::unique_ptr<cache::Slot> FlintContinuationAdapter::CreateSlot(
       [owner](std::uint32_t first, std::uint32_t end) {
         if (first == end)
           return;
-        for (const auto& component : owner->adapter.components_)
-          if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
-            owner->guard.BeforeOverwrite(component.descriptor.id, first, end);
+        for (const auto& component : owner->adapter.components_) {
+          if (!cache::HasRows(component.descriptor.kind))
+            continue;
+          owner->guard.BeforeOverwrite(component.descriptor.id, first, end);
+          // A ring evicts row p - ring when row p is written.
+          if (component.descriptor.kind == cache::ComponentKind::kWindowRows) {
+            const std::uint32_t ring =
+                owner->session->KvRingRows(component.layer);
+            if (ring != 0 && end > ring)
+              owner->guard.BeforeOverwrite(component.descriptor.id,
+                                           first > ring ? first - ring : 0,
+                                           end - ring);
+          }
+        }
       });
   return state;
 }
@@ -348,7 +368,7 @@ void FlintContinuationAdapter::BeginRestore(
   // Rows are written in place: guard every append range the restore can
   // replace while the old slot is still readable, then drain the device.
   for (const auto& component : components_)
-    if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+    if (cache::HasRows(component.descriptor.kind))
       state.guard.BeforeOverwrite(component.descriptor.id, 0, context_);
   SyncSession(*state.session);
 
@@ -438,6 +458,33 @@ cache::Completion FlintContinuationAdapter::LoadPrivatePiece(
   }
 }
 
+// Copies rows [first, end) of a K/V component between the session and `host`
+// (host bytes or a device span; hipMemcpyDefault infers the direction through
+// unified addressing). A ring layer wraps: the copy is split where the ring
+// does, and position p lives at row p % ring.
+void CopyComponentRows(FlintSession& session, std::uint32_t layer,
+                       bool is_value, std::size_t row, Rows first, Rows end,
+                       std::byte* host, bool to_host) {
+  auto* base = static_cast<std::byte*>(session.KvRows(layer, is_value));
+  if (base == nullptr)
+    throw std::logic_error("Flint KV rows are not allocated");
+  const std::uint32_t ring = session.KvRingRows(layer);
+  for (Rows at = first; at < end;) {
+    const Rows slot = ring != 0 ? at % ring : at;
+    const Rows count =
+        std::min<Rows>(end - at, ring != 0 ? ring - slot : end - at);
+    std::byte* device = base + std::size_t{slot} * row;
+    std::byte* mine = host + std::size_t{at - first} * row;
+    if (to_host)
+      Check(hipMemcpy(mine, device, std::size_t{count} * row,
+                      hipMemcpyDeviceToHost));
+    else
+      Check(hipMemcpy(device, mine, std::size_t{count} * row,
+                      hipMemcpyDefault));
+    at += count;
+  }
+}
+
 cache::Completion FlintContinuationAdapter::CopyRowsOut(
     const cache::Slot& slot, cache::ComponentId id, cache::Rows first,
     cache::Rows end, std::span<std::byte> bytes, cache::Stream& stream) {
@@ -446,8 +493,8 @@ cache::Completion FlintContinuationAdapter::CopyRowsOut(
   if (!state.IsValid())
     throw std::logic_error("cannot read an invalid Flint slot");
   const auto& component = RequireComponent(id);
-  if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
-    throw std::invalid_argument("Flint component has no append rows");
+  if (!cache::HasRows(component.descriptor.kind))
+    throw std::invalid_argument("Flint component has no rows");
   const auto row = row_bytes_;
   // Bound by Capacity, not Position: a rewound slot may still hold rows that
   // a borrowed frontier needs preserved.
@@ -456,13 +503,15 @@ cache::Completion FlintContinuationAdapter::CopyRowsOut(
     throw std::invalid_argument("invalid Flint row capture");
   if (first == end)
     return State::Settled(true);
+  // A ring no longer holds rows older than its length.
+  const std::uint32_t ring = state.session->KvRingRows(component.layer);
+  if (ring != 0 && (end - first > ring ||
+                    (state.session->Position() > ring &&
+                     first < state.session->Position() - ring)))
+    throw std::invalid_argument("Flint ring rows are no longer held");
   SyncSession(*state.session);
-  const auto* base = static_cast<const std::byte*>(state.session->KvRows(
-      component.layer, component.is_value));
-  if (base == nullptr)
-    throw std::logic_error("Flint KV rows are not allocated");
-  Check(hipMemcpy(bytes.data(), base + first * row, bytes.size(),
-                  hipMemcpyDeviceToHost));
+  CopyComponentRows(*state.session, component.layer, component.is_value, row,
+                    first, end, bytes.data(), true);
   return State::Settled(true);
 }
 
@@ -475,23 +524,18 @@ cache::Completion FlintContinuationAdapter::CopyRowsIn(
     throw std::logic_error("Flint load requires an unfailed restore");
   try {
     const auto& component = RequireComponent(id);
-    if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
-      throw std::invalid_argument("Flint component has no append rows");
+    if (!cache::HasRows(component.descriptor.kind))
+      throw std::invalid_argument("Flint component has no rows");
     const auto row = row_bytes_;
-    if (first > end || end > state.expected_position ||
+    const Rows lowest =
+        cache::FirstChunkRow(component.descriptor, state.expected_position);
+    if (first > end || first < lowest || end > state.expected_position ||
         bytes.size() != (end - first) * row)
       throw std::invalid_argument("invalid Flint row restore");
     if (first == end)
       return State::Settled(true);
-    auto* base = static_cast<std::byte*>(state.session->KvRows(
-        component.layer, component.is_value));
-    if (base == nullptr)
-      throw std::logic_error("Flint KV rows are not allocated");
-    auto* target = base + first * row;
-    // The source is either host bytes (RAM cache copy) or a device span from
-    // BorrowRowsView on a live slot. hipMemcpyDefault infers the direction
-    // from unified addressing; a fixed H2D kind would misread device sources.
-    Check(hipMemcpy(target, bytes.data(), bytes.size(), hipMemcpyDefault));
+    CopyComponentRows(*state.session, component.layer, component.is_value, row,
+                      first, end, const_cast<std::byte*>(bytes.data()), false);
     state.Cover(id.value - 1, first * row, end * row);
     return State::Settled(true);
   } catch (...) {
@@ -507,16 +551,27 @@ std::span<const std::byte> FlintContinuationAdapter::BorrowRowsView(
   if (!state.IsValid())
     throw std::logic_error("cannot borrow invalid Flint rows");
   const auto& component = RequireComponent(id);
-  if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
-    throw std::logic_error("Flint component has no append rows");
+  if (!cache::HasRows(component.descriptor.kind))
+    throw std::logic_error("Flint component has no rows");
   if (first >= end || end > state.session->Position())
     throw std::invalid_argument("invalid Flint borrowed range");
+  const std::uint32_t ring = state.session->KvRingRows(component.layer);
+  // A view is one contiguous device range: empty when it wraps the ring, or
+  // when the ring has already evicted its first rows.
+  if (ring != 0) {
+    if (end - first > ring || first % ring + (end - first) > ring ||
+        (state.session->Position() > ring &&
+         first < state.session->Position() - ring))
+      return {};
+  }
   SyncSession(*state.session);
   const auto* base = static_cast<const std::byte*>(state.session->KvRows(
       component.layer, component.is_value));
   if (base == nullptr)
     throw std::logic_error("Flint KV rows are not allocated");
-  return {base + first * row_bytes_, (end - first) * row_bytes_};
+  const Rows slot_row = ring != 0 ? first % ring : first;
+  return {base + std::size_t{slot_row} * row_bytes_,
+          std::size_t{end - first} * row_bytes_};
 }
 
 bool FlintContinuationAdapter::Validate(
@@ -540,6 +595,10 @@ bool FlintContinuationAdapter::Validate(
     const auto& descriptor = descriptors_[i];
     if (std::ranges::count(positions, expected) != 1 ||
         !Covered(state.coverage[i],
+                 cache::HasRows(descriptor.kind)
+                     ? cache::FirstChunkRow(descriptor, expected.valid_rows) *
+                           descriptor.row_bytes
+                     : 0,
                  descriptor.row_bytes
                      ? expected.valid_rows * descriptor.row_bytes
                      : descriptor.state_bytes))
@@ -579,7 +638,7 @@ bool FlintContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
   try {
     auto& state = As(slot);
     for (const auto& component : components_)
-      if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+      if (cache::HasRows(component.descriptor.kind))
         state.guard.BeforeRelease(component.descriptor.id, 0, context_);
     state.session->Reset();
     state.restoring = false;
