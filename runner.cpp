@@ -44,7 +44,7 @@ using ext::TextRunnerToken;
 constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v2";
 // Per-layer K/V append rows plus a metadata/logits private state. A v1
 // single-blob disk cache must not load into this layout.
-constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-v1";
+constexpr std::string_view kFlintPayloadLayout = "flint-kv-rows-window-v1";
 
 // A retained snapshot is one full private state (~15.7 GiB at 130k context
 // on this model). The host captures it synchronously on the request thread,
